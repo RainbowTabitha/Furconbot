@@ -1,4 +1,2 @@
+*.env
 __pycache__/
-activity_log.json
-levels.json
-*.key
