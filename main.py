@@ -6,7 +6,8 @@
 import os
 import platform
 import discord
-from dotenv import load_dotenv
+import json
+from pathlib import Path
 
 from cogs.base import Base
 from cogs.telegram import TelegramRSSBridge
@@ -14,8 +15,9 @@ from cogs.telegram import TelegramRSSBridge
 from discord.ext import tasks
 from discord.ext import commands
 
-# Load environment variables from .env file
-load_dotenv()
+# Load keys from keys.json
+with open('keys.json', 'r') as f:
+    keys = json.load(f)
 
 #Intents
 intents = discord.Intents.all()
@@ -41,6 +43,6 @@ async def on_ready():
 bot.add_cog(TelegramRSSBridge(bot))
 bot.add_cog(Base(bot))
 
-# To Discord
-TOKEN = os.environ.get("DISCORD_TOKEN")
+# Get Discord token from keys.json
+TOKEN = keys.get("discord_token")
 bot.run(TOKEN)

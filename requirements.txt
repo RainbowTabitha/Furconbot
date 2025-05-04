@@ -1,6 +1,5 @@
 py-cord
 aiohttp
 feedparser
-python-dotenv
 cloudscraper
 telethon
