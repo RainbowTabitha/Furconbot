@@ -359,28 +359,57 @@ class TelegramRSSBridge(commands.Cog):
                 if not channel:
                     continue
 
-                entries = []
-                start_date = datetime(2025, 1, 1, tzinfo=timezone.utc)
-                
+                # Get the latest post's date from our posted links
+                latest_post_date = None
                 for entry in feed.entries:
+                    if entry.link in self.posted_links[channel_name]:
+                        if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                            post_date = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                            if latest_post_date is None or post_date > latest_post_date:
+                                latest_post_date = post_date
+
+                # If we have no posts yet, only process the most recent one
+                if latest_post_date is None and feed.entries:
+                    entry = feed.entries[0]
                     if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                        post_date = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-                        if post_date >= start_date:
-                            entries.append((post_date, entry))
-
-                entries.sort(key=lambda x: x[0])
-
-                for post_date, entry in entries:
-                    link = entry.link
-                    if link not in self.posted_links[channel_name]:
                         try:
                             embed = await self.format_message(entry, channel_name)
                             await channel.send(embed=embed)
-                            self.posted_links[channel_name].append(link)
+                            self.posted_links[channel_name].append(entry.link)
                             self.save_posted_links()
-                            await asyncio.sleep(1)
                         except Exception:
                             continue
+                    continue
+
+                # Process only new posts that are after our latest post
+                new_entries = []
+                for entry in feed.entries:
+                    if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                        post_date = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                        if latest_post_date and post_date > latest_post_date and entry.link not in self.posted_links[channel_name]:
+                            new_entries.append((post_date, entry))
+
+                # Sort new entries by date
+                new_entries.sort(key=lambda x: x[0])
+
+                # Process new entries
+                for post_date, entry in new_entries:
+                    try:
+                        embed = await self.format_message(entry, channel_name)
+                        message = await channel.send(embed=embed)
+                        
+                        # If this is an announcement channel, publish the message
+                        if isinstance(channel, discord.TextChannel) and channel.is_news():
+                            try:
+                                await message.publish()
+                            except (discord.Forbidden, discord.HTTPException):
+                                pass
+                                
+                        self.posted_links[channel_name].append(entry.link)
+                        self.save_posted_links()
+                        await asyncio.sleep(1)
+                    except Exception:
+                        continue
 
             except Exception:
                 continue
