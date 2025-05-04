@@ -1,11 +1,6 @@
-requests
 py-cord
-dadjokes
-box
 aiohttp
-Pillow
-pytz
-yt-dlp
 feedparser
 python-dotenv
 cloudscraper
+telethon
