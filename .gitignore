@@ -1,2 +1,4 @@
 *.env
 __pycache__/
+posted_links.json
+keys.json

@@ -7,7 +7,10 @@ from pathlib import Path
 from datetime import datetime, timezone
 import re
 import asyncio
+from telethon import TelegramClient
+import os
 from typing import Dict, List, Optional
+import aiohttp
 
 class TelegramRSSBridge(commands.Cog):
     def __init__(self, bot, since_date=None):
@@ -15,6 +18,16 @@ class TelegramRSSBridge(commands.Cog):
         self.mappings_path = "mappings.json"
         self.posted_links_path = "posted_links.json"
         self.pending_posts_path = "pending_posts.json"
+        self.keys_path = "keys.json"
+        
+        # Load keys from keys.json
+        try:
+            with open(self.keys_path, 'r') as f:
+                self.keys = json.load(f)
+        except FileNotFoundError:
+            print("Error: keys.json not found!")
+            self.keys = {}
+        
         self.channel_mappings = self.load_mappings()
         self.posted_links = self.load_posted_links()
         self.pending_posts: Dict[str, List[dict]] = self.load_pending_posts()
@@ -22,13 +35,40 @@ class TelegramRSSBridge(commands.Cog):
         self.scraper = cloudscraper.create_scraper()
         self.color = 0x0088cc  # Telegram's brand color
         self.check_rss.start()
+        
+        # Initialize Telegram client
+        self.tg_client = None
+        self.telegram_api_id = self.keys.get("telegram_api_id")
+        self.telegram_api_hash = self.keys.get("telegram_api_hash")
+        self.telegram_bot_token = self.keys.get("telegram_bot_token")
+        self.telegram_phone = None
+        
+        self.tg_client = TelegramClient('telegram_session', 
+                                      self.telegram_api_id,
+                                      self.telegram_api_hash)
+
+    async def start_telegram_client(self):
+        """Start the Telegram client with appropriate authentication"""
+        if not self.tg_client.is_connected():
+            await self.tg_client.connect()
+            
+        if not await self.tg_client.is_user_authorized():
+            if self.telegram_bot_token:
+                # Use bot token
+                await self.tg_client.start(bot_token=self.telegram_bot_token)
+            elif self.telegram_phone:
+                # Use phone number authentication
+                await self.tg_client.start(phone=self.telegram_phone)
+            else:
+                print("Error: No authentication method provided. Please set either telegram_bot_token or telegram_phone")
+                return False
+        return True
 
     def load_mappings(self):
         path = Path(self.mappings_path)
         if not path.exists():
             with path.open("w") as f:
                 json.dump({}, f, indent=4)
-            print(f"Created empty {self.mappings_path}")
             return {}
         with path.open("r") as f:
             return json.load(f)
@@ -62,6 +102,8 @@ class TelegramRSSBridge(commands.Cog):
             json.dump(self.pending_posts, f, indent=4)
 
     def cog_unload(self):
+        if self.tg_client and self.tg_client.is_connected():
+            self.tg_client.disconnect()
         self.save_posted_links()
         self.save_pending_posts()
         self.check_rss.cancel()
@@ -136,6 +178,78 @@ class TelegramRSSBridge(commands.Cog):
         spaces = text.count(" ")
         return spaces > chars * 0.5  # If more than 50% of non-space chars have spaces between them
 
+    async def get_file_path(self, file_id: str) -> str:
+        """Get the file path from Telegram's API"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.telegram.org/bot{self.telegram_bot_token}/getFile"
+                params = {'file_id': file_id}
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('ok'):
+                            return data['result']['file_path']
+            return None
+        except Exception as e:
+            print(f"Error getting file path: {str(e)}")
+            return None
+
+    async def upload_to_imgbb(self, image_path: str) -> str:
+        """Upload an image to imgbb and return the URL"""
+        try:
+            api_key = self.keys.get("imgbb_api_key")
+            if not api_key:
+                return None
+            
+            async with aiohttp.ClientSession() as session:
+                data = aiohttp.FormData()
+                data.add_field('key', api_key)
+                data.add_field('image', open(image_path, 'rb'))
+                
+                async with session.post('https://api.imgbb.com/1/upload', data=data) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('success'):
+                            image_data = data['data']
+                            if image_data.get('image', {}).get('url'):
+                                return image_data['image']['url']
+                            elif image_data.get('display_url'):
+                                return image_data['display_url']
+                            elif image_data.get('url'):
+                                return image_data['url']
+            return None
+        except Exception:
+            return None
+
+    async def get_media_url(self, channel_name: str, message_id: int) -> str:
+        """Get direct media URL from Telegram"""
+        if not self.tg_client:
+            return None
+            
+        try:
+            if not await self.start_telegram_client():
+                return None
+
+            channel_name = channel_name.replace('telegram/channel/', '').replace('channel/', '')
+            channel = await self.tg_client.get_entity(channel_name)
+            message = await self.tg_client.get_messages(channel, ids=message_id)
+            
+            if message and message.media:
+                try:
+                    if hasattr(message.media, 'photo') or hasattr(message.media, 'document'):
+                        temp_path = f"temp_{message_id}.jpg"
+                        path = await message.download_media(temp_path)
+                        if path:
+                            url = await self.upload_to_imgbb(path)
+                            os.remove(path)
+                            return url
+                except Exception:
+                    if 'path' in locals() and os.path.exists(path):
+                        os.remove(path)
+            return None
+        except Exception:
+            return None
+
     async def format_message(self, entry, channel_name):
         embed = discord.Embed(color=self.color)
         
@@ -156,44 +270,63 @@ class TelegramRSSBridge(commands.Cog):
                 icon_url="https://telegram.org/img/t_logo.png"
             )
 
-        # Remove forwarding header
+        # Remove forwarding header and clean content
         clean_content = re.sub(r'Forwarded From.*?\)', '', content)
-        
-        # If content appears to be spaced out, join it first
         if self.is_spaced_text(clean_content):
             clean_content = ''.join(clean_content.split())
-            
-        # Then apply the rest of the cleaning
         clean_content = self.clean_text(clean_content)
-
         if clean_content:
             embed.description = clean_content
 
         # Handle images
         img_urls = []
         img_matches = re.finditer(r'<img[^>]+src="([^"]+)"[^>]*>', content)
-        for match in img_matches:
-            img_urls.append(match.group(1))
+        content_modified = content
         
-        file_matches = re.finditer(r'<b>([^<]+\.(?:jpg|jpeg|png|gif))</b>.*?<small>([^<]+)</small>', content)
-        for match in file_matches:
-            filename, filesize = match.groups()
-            if not img_urls:
-                embed.add_field(
-                    name="📎 Image",
-                    value=f"{filename}\nSize: {filesize}",
-                    inline=False
-                )
+        for match in img_matches:
+            url = match.group(1)
+            original_url = url
+            processed = False
+            
+            if 'undefined://' in url or 'undefined:' in url:
+                try:
+                    parts = url.split('/')
+                    msg_id_match = re.search(r'_(\d+)$', parts[-1])
+                    
+                    if not msg_id_match:
+                        continue
+                        
+                    msg_id = int(msg_id_match.group(1))
+                    
+                    channel = None
+                    if 'channel' in parts:
+                        channel_index = parts.index('channel')
+                        channel_part = '/'.join([p for i, p in enumerate(parts) if i > channel_index])
+                        channel_match = re.match(r'([^0-9]+)', channel_part)
+                        if channel_match:
+                            channel = channel_match.group(1).rstrip('_')
+                    
+                    if not channel:
+                        continue
+                    
+                    direct_url = await self.get_media_url(channel, msg_id)
+                    if direct_url:
+                        url = direct_url
+                        content_modified = content_modified.replace(original_url, url)
+                        processed = True
+                        
+                except Exception as e:
+                    print(f"Error processing undefined URL: {str(e)}")
+            
+            if url.startswith(('http://', 'https://')) and ' ' not in url and '\n' not in url:
+                img_urls.append(url)
+
+        content = content_modified
 
         if img_urls:
-            # Validate URL before setting it
             try:
                 url = img_urls[0]
-                # Basic URL validation
-                if url.startswith(('http://', 'https://')) and ' ' not in url and '\n' not in url:
-                    embed.set_image(url=url)
-                else:
-                    print(f"Invalid image URL skipped: {url}")
+                embed.set_image(url=url)
             except Exception as e:
                 print(f"Error setting image URL: {str(e)}")
             
@@ -213,13 +346,10 @@ class TelegramRSSBridge(commands.Cog):
 
     @tasks.loop(minutes=5)
     async def check_rss(self):
-        print("Checking RSS feeds")
         for channel_name, discord_channel_id in self.channel_mappings.items():
             try:
                 if channel_name not in self.posted_links:
                     self.posted_links[channel_name] = []
-                if channel_name not in self.pending_posts:
-                    self.pending_posts[channel_name] = []
 
                 rss_url = f"https://rss.tabithahanegan.com/telegram/channel/{channel_name}"
                 resp = self.scraper.get(rss_url, timeout=20)
@@ -227,41 +357,33 @@ class TelegramRSSBridge(commands.Cog):
                 
                 channel = self.bot.get_channel(int(discord_channel_id))
                 if not channel:
-                    print(f"Could not find Discord channel {discord_channel_id}")
                     continue
 
-                # Convert entries to list and sort by date
                 entries = []
                 start_date = datetime(2025, 1, 1, tzinfo=timezone.utc)
                 
                 for entry in feed.entries:
                     if hasattr(entry, 'published_parsed') and entry.published_parsed:
                         post_date = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-                        # Only include posts from 2025 onwards
                         if post_date >= start_date:
                             entries.append((post_date, entry))
 
-                # Sort entries by date, oldest first
                 entries.sort(key=lambda x: x[0])
 
-                # Process entries in chronological order
                 for post_date, entry in entries:
                     link = entry.link
                     if link not in self.posted_links[channel_name]:
-                        embed = await self.format_message(entry, channel_name)
-                        # Store the post in pending queue instead of sending immediately
-                        pending_post = {
-                            "link": link,
-                            "embed_dict": embed.to_dict(),
-                            "channel_id": discord_channel_id,
-                            "added_at": datetime.now(timezone.utc).isoformat(),
-                            "post_date": post_date.isoformat()
-                        }
-                        self.pending_posts[channel_name].append(pending_post)
-                        self.save_pending_posts()
+                        try:
+                            embed = await self.format_message(entry, channel_name)
+                            await channel.send(embed=embed)
+                            self.posted_links[channel_name].append(link)
+                            self.save_posted_links()
+                            await asyncio.sleep(1)
+                        except Exception:
+                            continue
 
-            except Exception as e:
-                print(f"Error processing channel {channel_name}: {str(e)}")
+            except Exception:
+                continue
 
     @check_rss.before_loop
     async def before_check_rss(self):
@@ -273,7 +395,6 @@ class TelegramRSSBridge(commands.Cog):
         """Commands for managing Telegram bridge posts"""
         if ctx.invoked_subcommand is None:
             await ctx.send("Please specify a subcommand. Use `help telegram` for more information.")
-
     @telegram_group.command(name="pending")
     async def list_pending(self, ctx, channel_name: Optional[str] = None):
         """List pending posts for a channel or all channels"""
@@ -319,14 +440,16 @@ class TelegramRSSBridge(commands.Cog):
         for post in posts_to_publish:
             channel = self.bot.get_channel(int(post["channel_id"]))
             if channel:
-                embed = discord.Embed.from_dict(post["embed_dict"])
-                await channel.send(embed=embed)
-                self.posted_links[channel_name].append(post["link"])
-                await asyncio.sleep(1)
+                try:
+                    embed = discord.Embed.from_dict(post["embed_dict"])
+                    await channel.send(embed=embed)
+                    self.posted_links[channel_name].append(post["link"])
+                    await asyncio.sleep(1)
+                except Exception:
+                    continue
 
         self.save_pending_posts()
         self.save_posted_links()
-        
         await ctx.send(f"Published {len(posts_to_publish)} posts for {channel_name}")
 
     @telegram_group.command(name="clear")
@@ -339,5 +462,4 @@ class TelegramRSSBridge(commands.Cog):
         post_count = len(self.pending_posts[channel_name])
         self.pending_posts[channel_name] = []
         self.save_pending_posts()
-        
         await ctx.send(f"Cleared {post_count} pending posts for {channel_name}")
