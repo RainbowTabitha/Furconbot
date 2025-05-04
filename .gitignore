@@ -2,3 +2,4 @@
 __pycache__/
 posted_links.json
 keys.json
+*.session
