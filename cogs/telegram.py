@@ -376,11 +376,16 @@ class TelegramRSSBridge(commands.Cog):
                         if entry.link not in self.posted_links[channel_name]:
                             new_entries.append((post_date, entry))
 
-                # Sort new entries by date
-                new_entries.sort(key=lambda x: x[0])
+                # Sort new entries by date, newest first for publishing
+                new_entries.sort(key=lambda x: x[0], reverse=True)
+                
+                # Only publish the 10 most recent posts to respect Discord's rate limit
+                posts_to_publish = new_entries[:10] if len(new_entries) > 10 else new_entries
+                # Resort to chronological order for posting
+                posts_to_publish.sort(key=lambda x: x[0])
 
                 # Process new entries
-                for post_date, entry in new_entries:
+                for post_date, entry in posts_to_publish:
                     try:
                         embed = await self.format_message(entry, channel_name)
                         message = await channel.send(embed=embed)
@@ -409,6 +414,19 @@ class TelegramRSSBridge(commands.Cog):
                     except Exception as e:
                         print(f"Error processing entry: {str(e)}")
                         continue
+                        
+                # Process remaining entries without publishing
+                if len(new_entries) > 10:
+                    for post_date, entry in new_entries[10:]:
+                        try:
+                            embed = await self.format_message(entry, channel_name)
+                            await channel.send(embed=embed)
+                            self.posted_links[channel_name].append(entry.link)
+                            self.save_posted_links()
+                            await asyncio.sleep(1)
+                        except Exception as e:
+                            print(f"Error processing entry: {str(e)}")
+                            continue
 
             except Exception:
                 continue
