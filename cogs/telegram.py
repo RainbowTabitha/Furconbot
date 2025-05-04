@@ -368,25 +368,12 @@ class TelegramRSSBridge(commands.Cog):
                             if latest_post_date is None or post_date > latest_post_date:
                                 latest_post_date = post_date
 
-                # If we have no posts yet, only process the most recent one
-                if latest_post_date is None and feed.entries:
-                    entry = feed.entries[0]
-                    if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                        try:
-                            embed = await self.format_message(entry, channel_name)
-                            await channel.send(embed=embed)
-                            self.posted_links[channel_name].append(entry.link)
-                            self.save_posted_links()
-                        except Exception:
-                            continue
-                    continue
-
-                # Process only new posts that are after our latest post
+                # Process all posts that we haven't seen before
                 new_entries = []
                 for entry in feed.entries:
                     if hasattr(entry, 'published_parsed') and entry.published_parsed:
                         post_date = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-                        if latest_post_date and post_date > latest_post_date and entry.link not in self.posted_links[channel_name]:
+                        if entry.link not in self.posted_links[channel_name]:
                             new_entries.append((post_date, entry))
 
                 # Sort new entries by date
@@ -400,15 +387,27 @@ class TelegramRSSBridge(commands.Cog):
                         
                         # If this is an announcement channel, publish the message
                         if isinstance(channel, discord.TextChannel) and channel.is_news():
+                            # Check permissions first
+                            permissions = channel.permissions_for(channel.guild.me)
+                            if not permissions.manage_messages:
+                                print(f"Bot lacks manage_messages permission in channel {channel.name}")
+                                continue
+                                
                             try:
                                 await message.publish()
-                            except (discord.Forbidden, discord.HTTPException):
-                                pass
+                                print(f"Successfully published message in announcement channel {channel.name}")
+                            except discord.Forbidden:
+                                print(f"Missing permissions to publish in announcement channel {channel.name}")
+                            except discord.HTTPException as e:
+                                print(f"HTTP error when publishing in announcement channel {channel.name}: {str(e)}")
+                            except Exception as e:
+                                print(f"Unexpected error when publishing in announcement channel {channel.name}: {str(e)}")
                                 
                         self.posted_links[channel_name].append(entry.link)
                         self.save_posted_links()
                         await asyncio.sleep(1)
-                    except Exception:
+                    except Exception as e:
+                        print(f"Error processing entry: {str(e)}")
                         continue
 
             except Exception:
